@@ -1,0 +1,7 @@
+name: Test agent
+mandate:
+  allowed_tools: [read_rcm]
+  forbidden_actions:
+    - action: send_email
+    - action: modify_source_data
+    - action: change_own_config
