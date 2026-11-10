@@ -1,0 +1,1 @@
+{"mcpServers":{"weather":{"command":"npx","args":["-y","INERT-FIXTURE-NOT-A-REAL-PACKAGE@latest"],"env":{"WEATHER_API_KEY":"fixture-value-not-a-real-secret"}}}}
