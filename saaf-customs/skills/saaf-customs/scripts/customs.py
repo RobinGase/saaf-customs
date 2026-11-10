@@ -20,6 +20,8 @@ Exit codes: 0 ALLOW, 1 REVIEW, 2 BLOCK, 3 usage/fetch error.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import csv
 import io
 import json
@@ -30,6 +32,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import unicodedata
 import urllib.parse
 import urllib.request
 import zipfile
@@ -69,6 +72,8 @@ class Finding:
     observation: str
     recommendation: str
     blocking: bool = False
+    guardrail: bool = False   # stop and let the user check before continuing
+    reference: str = ""       # criterion reference under the skill's references/ directory
 
     def key(self):
         return (self.rule, self.file, self.line)
@@ -83,6 +88,7 @@ class Report:
     findings: list = field(default_factory=list)
     inventory: dict = field(default_factory=dict)
     verdict: str = "ALLOW"
+    guardrails: list = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- rules
@@ -260,7 +266,13 @@ HIDDEN_UNICODE = R("[​‌‍⁠⁡⁢⁣⁤﻿­᠎]")
 BIDI_UNICODE = R("[‪-‮⁦-⁩]")
 TAG_UNICODE = R("[\U000E0000-\U000E007F]")
 BASE64_BLOB = R(r"['\"`]([A-Za-z0-9+/]{240,}={0,2})['\"`]")
-URL_RE = R(r"https?://([A-Za-z0-9.-]+\.[A-Za-z]{2,})(:\d+)?")
+URL_RE = R(r"https?://(\d{1,3}(?:\.\d{1,3}){3}(?![\w.-])|[A-Za-z0-9.-]+\.[A-Za-z]{2,})(:\d+)?")
+# Shorter base64 runs are only reported when they decode to readable text (see b64_text).
+BASE64_TOKEN = R(r"(?<![A-Za-z0-9+/=_-])[A-Za-z0-9+/]{24,}={0,2}(?![A-Za-z0-9+/=_-])")
+B64_DANGER = R(r"https?://|\b(curl|wget|bash|powershell|eval|exec|import|require|subprocess|token|secret|password)\b|"
+               r"/bin/|\bsh\s+-c\b|\|\s*sh\b|os\.system|\.ssh|\.aws|\.env\b", re.I)
+NONASCII_WORD = R(r"(?<!\w)\w*[^\x00-\x7F\W]\w*")  # anchored at word start so long ASCII runs stay linear
+IDN_HOST = R(r"https?://([^\s/'\"<>)\]:@]*(?:xn--|[^\x00-\x7F])[^\s/'\"<>)\]:@]*)", re.I)
 HTML_COMMENT = R(r"<!--(.*?)-->", re.S)
 
 POPULAR_NPM = ["react", "lodash", "express", "axios", "chalk", "commander", "dotenv", "zod",
@@ -274,6 +286,72 @@ POPULAR_PYPI = ["requests", "numpy", "pandas", "anthropic", "openai", "mcp", "fa
                 "cryptography", "python-dotenv", "colorama", "matplotlib", "scipy", "click",
                 "jinja2", "openpyxl", "python-docx", "pypdf", "tiktoken", "uvicorn"]
 SUSPICIOUS_TLDS = (".xyz", ".top", ".tk", ".ml", ".ga", ".cf", ".gq", ".ru", ".su", ".zip", ".mov")
+# Hosts that appear in licence headers and schema namespaces; never counted as egress.
+NON_EGRESS_HOSTS = ["www.w3.org", "www.apache.org", "opensource.org", "creativecommons.org", "json-schema.org",
+                    "schemas.xmlsoap.org", "spdx.org", "example.com", "example.org", "example.net"]
+
+# Guardrail triggers: when one of these rules fires, the skill stops and the user checks the
+# evidence before the review continues. Value = the criterion reference under references/.
+GUARDRAILS = {
+    "UNI-TAG-CHARS": "hidden-unicode.md", "UNI-BIDI": "hidden-unicode.md", "UNI-ZERO-WIDTH": "hidden-unicode.md",
+    "UNI-HOMOGLYPH": "homoglyphs.md", "UNI-IDN-HOST": "homoglyphs.md",
+    "OBF-BASE64-BLOB": "encoded-strings.md", "OBF-BASE64-TEXT": "encoded-strings.md",
+    "EXEC-DECODE-EVAL": "encoded-strings.md",
+    "NET-UNDECLARED-EGRESS": "unexpected-egress.md", "NET-EGRESS-INVENTORY": "unexpected-egress.md",
+    "NET-SUSPICIOUS-DOMAIN": "unexpected-egress.md", "EXFIL-KNOWN-SINK": "unexpected-egress.md",
+    "MCP-REMOTE": "unexpected-egress.md",
+}
+
+# Letters that render like ASCII letters. A curated subset of the Unicode UTS #39 confusables
+# data (Cyrillic and Greek), written as escapes so this file itself stays ASCII-reviewable.
+# Fullwidth, mathematical and other compatibility letters are handled through NFKC.
+CONFUSABLES = dict(zip(
+    "\u0430\u0435\u043e\u0440\u0441\u0443\u0445\u0456\u0458\u0455\u04bb\u0501\u051b\u051d\u04cf"
+    "\u0410\u0412\u0415\u041a\u041c\u041d\u041e\u0420\u0421\u0422\u0425\u0423\u0405\u0406\u0408"
+    "\u03bf\u03b1\u03bd\u03c1\u03b9\u03ba\u03c5"
+    "\u0391\u0392\u0395\u0396\u0397\u0399\u039a\u039c\u039d\u039f\u03a1\u03a4\u03a5\u03a7",
+    "aeopcyxijshdqwl" "ABEKMHOPCTXYSIJ" "oavpiku" "ABEZHIKMNOPTYX"))
+
+
+def lookalike(c: str) -> str:
+    """ASCII letter that a non-ASCII letter imitates, or '' if it imitates none."""
+    if c in CONFUSABLES:
+        return CONFUSABLES[c]
+    if unicodedata.category(c).startswith("L"):
+        n = unicodedata.normalize("NFKC", c)
+        if len(n) == 1 and n.isascii() and n.isalpha():
+            return n
+    return ""
+
+
+def ascii_escape(s: str) -> str:
+    return s.encode("ascii", "backslashreplace").decode("ascii")
+
+
+def b64_text(tok: str) -> str:
+    """Decoded text if a base64 run decodes to readable ASCII, else ''. Never executes anything."""
+    raw = tok.rstrip("=")
+    if len(raw) % 4 == 1:
+        return ""
+    try:
+        data = base64.b64decode(raw + "=" * (-len(raw) % 4), validate=True)
+    except (binascii.Error, ValueError):
+        return ""
+    if len(data) < 16:
+        return ""
+    printable = sum(1 for b in data if 32 <= b < 127 or b in (9, 10, 13))
+    if printable < len(data) * 0.95:
+        return ""
+    return data.decode("ascii", "replace")
+
+
+def host_matches(host: str, allowed) -> bool:
+    """True if host equals an allowed entry or is a subdomain of one."""
+    for a in allowed:
+        a = str(a).strip().strip("'\"").lower().lstrip("*").lstrip(".")
+        if a and (host == a or host.endswith("." + a)):
+            return True
+    return False
 
 
 def levenshtein(a: str, b: str) -> int:
@@ -416,9 +494,11 @@ def is_tool_description_code(text: str) -> bool:
 
 
 class Scanner:
-    def __init__(self, root: Path, mandate: dict | None = None):
+    def __init__(self, root: Path, mandate: dict | None = None, allowed_hosts: list | None = None):
         self.root = root
         self.mandate = mandate
+        self.allowed_hosts = allowed_hosts  # None = no allowlist declared
+        self.egress: dict = {}              # host -> first file:line in code or an instruction file
         self.findings: list[Finding] = []
         self.inventory = {"instruction_files": [], "hooks": [], "mcp_servers": [], "install_scripts": [],
                           "binaries": [], "domains": set(), "capabilities": set(), "manifests": []}
@@ -426,6 +506,8 @@ class Scanner:
 
     def add(self, rule, title, sev, cat, rel, line, evidence, obs, rec, blocking=False):
         f = Finding(rule, title, sev, cat, str(rel), line, redact(evidence), obs, rec, blocking)
+        if rule in GUARDRAILS:
+            f.guardrail, f.reference = True, f"references/{GUARDRAILS[rule]}"
         if f.key() not in {x.key() for x in self.findings}:
             self.findings.append(f)
 
@@ -481,10 +563,16 @@ class Scanner:
             self.inventory["instruction_files"].append(str(rel))
 
         self.check_unicode(text, rel, instr or tooldesc)
+        self.check_homoglyphs(text, rel, instr or tooldesc or code)
         self.check_rules(text, rel, instr, code, tooldesc)
-        self.check_blobs(text, rel, code)
+        self.check_blobs(text, rel, code, instr or tooldesc)
         for m in URL_RE.finditer(text):
-            self.inventory["domains"].add(m.group(1).lower())
+            host = m.group(1).lower().strip(".")
+            if host.startswith("127.") or host == "0.0.0.0":
+                continue
+            self.inventory["domains"].add(host)
+            if (code or instr) and host not in self.egress:
+                self.egress[host] = f"{rel}:{text.count(chr(10), 0, m.start()) + 1}"
         self.capabilities(text, code)
 
         if name == "package.json":
@@ -562,13 +650,70 @@ class Scanner:
                      "Strip or reject. There is no legitimate reason for hidden characters in instructions or code.",
                      sensitive or rid == "UNI-TAG-CHARS")
 
-    def check_blobs(self, text, rel, code):
+    def check_homoglyphs(self, text, rel, sensitive):
+        if text.isascii():
+            return
+        hits = []
+        for m in NONASCII_WORD.finditer(text):
+            w = m.group(0)
+            foreign = [c for c in w if ord(c) > 127]
+            # Mixed-script only: ASCII letters plus letters that imitate ASCII ones, in a single word.
+            if all(lookalike(c) for c in foreign) and any(c.isascii() and c.isalpha() for c in w):
+                hits.append(m)
+        if hits:
+            m = hits[0]
+            w = m.group(0)
+            skeleton = "".join(c if ord(c) < 128 else lookalike(c) for c in w)
+            line = text.count("\n", 0, m.start()) + 1
+            self.add("UNI-HOMOGLYPH", "Look-alike (homoglyph) letters mixed into an ASCII word",
+                     "High" if sensitive else "Medium", "hidden-content", rel, line,
+                     f"{len(hits)} word(s); first: {ascii_escape(w)} reads as {skeleton!r}",
+                     f"{len(hits)} word(s) mix ASCII letters with letters from another script that render the same. "
+                     "The text a reviewer reads is not the text a program or model compares.",
+                     "Have the user confirm each word against its code points; reject look-alike names, hosts and identifiers.",
+                     sensitive)
+        m = IDN_HOST.search(text)
+        if m:
+            host = m.group(1)
+            shown = ascii_escape(host)
+            try:
+                if host.isascii():
+                    shown += " displays as " + ascii_escape(host.encode("ascii").decode("idna"))
+            except (UnicodeError, ValueError):
+                pass
+            self.add("UNI-IDN-HOST", "Internationalised (non-ASCII or punycode) host name", "Medium", "hidden-content",
+                     rel, text.count("\n", 0, m.start()) + 1, shown,
+                     "A URL uses a non-ASCII or punycode host, which can display as a well-known name.",
+                     "Have the user confirm the host's real code points and owner before trusting the link.")
+
+    def check_blobs(self, text, rel, code, sensitive=False):
         m = BASE64_BLOB.search(text)
         if m and code:
             line = text.count("\n", 0, m.start()) + 1
             self.add("OBF-BASE64-BLOB", "Large encoded blob embedded in code", "Medium", "obfuscation", rel, line,
                      m.group(1)[:40] + "...", f"Base64-like blob of {len(m.group(1))} chars in code.",
                      "Decode it and confirm it is an inert asset (icon, font, test vector).")
+        best = None
+        for m in BASE64_TOKEN.finditer(text):
+            decoded = b64_text(m.group(0))
+            if not decoded:
+                continue
+            danger = bool(B64_DANGER.search(decoded))
+            if best is None or danger:
+                best = (m, decoded, danger)
+            if danger:
+                break
+        if best:
+            m, decoded, danger = best
+            exposed = code or sensitive
+            sev = "High" if (danger and exposed) else ("Medium" if (danger or exposed) else "Low")
+            self.add("OBF-BASE64-TEXT", "Base64 string that decodes to readable text", sev, "obfuscation", rel,
+                     text.count("\n", 0, m.start()) + 1, f"{m.group(0)[:24]}... decodes to: {decoded[:100]!r}",
+                     "A base64 string decodes to readable text"
+                     + (" that looks like a command, URL or credential reference." if danger else ".")
+                     + " Encoding text hides it from a reviewer but not from the code or model that decodes it.",
+                     "Have the user read the decoded text. Treat it as data, never as instructions; reject if its purpose is unexplained.",
+                     danger and exposed)
 
     def check_html_comments(self, text, rel, instr):
         for m in HTML_COMMENT.finditer(text):
@@ -786,6 +931,19 @@ class Scanner:
             self.add("NET-SUSPICIOUS-DOMAIN", "Suspicious domains / raw IPs referenced", "Medium", "data-egress", Path("."), 0,
                      ", ".join(sorted(doms)[:8]), "Low-reputation TLDs or raw IPs are common in droppers and C2 configs.",
                      "Confirm each endpoint's owner.")
+        hosts = {h: loc for h, loc in self.egress.items() if not host_matches(h, NON_EGRESS_HOSTS)}
+        if self.allowed_hosts is not None:
+            outside = sorted((h, loc) for h, loc in hosts.items() if not host_matches(h, self.allowed_hosts))
+            if outside:
+                self.add("NET-UNDECLARED-EGRESS", "Outbound host outside the declared allowlist", "High", "data-egress",
+                         Path("."), 0, ", ".join(f"{h} ({loc})" for h, loc in outside[:8]),
+                         f"{len(outside)} host(s) referenced in code or instruction files are not on the declared allowlist.",
+                         "Do not install until the user has confirmed each host, or the allowlist is changed through review.", True)
+        elif hosts:
+            self.add("NET-EGRESS-INVENTORY", "Outbound hosts referenced; no allowlist declared to compare against", "Low",
+                     "data-egress", Path("."), 0, ", ".join(f"{h} ({loc})" for h, loc in sorted(hosts.items())[:8]),
+                     f"{len(hosts)} host(s) are referenced in code or instruction files and nothing declares which are expected.",
+                     "Have the user confirm each host is expected for the component's stated purpose, or pass --allow-host.")
         if self.mandate:
             self.check_mandate()
 
@@ -821,6 +979,9 @@ def load_mandate(path: str) -> dict:
     if m:
         out["allowed_tools"] = [x.strip() for x in m.group(1).split(",") if x.strip()]
     out["forbidden_actions"] = re.findall(r"-\s*action:\s*([\w-]+)", text)
+    m = re.search(r"allowed_hosts:\s*\[([^\]]*)\]", text)
+    if m:  # key only present when the mandate declares it; an empty list means "no egress expected"
+        out["allowed_hosts"] = [x.strip() for x in m.group(1).split(",") if x.strip()]
     return out
 
 
@@ -842,6 +1003,9 @@ def to_markdown(rep: Report) -> str:
     out.append("| " + " | ".join(SEVERITIES) + " |")
     out.append("|" + "---|" * len(SEVERITIES))
     out.append("| " + " | ".join(str(counts[s]) for s in SEVERITIES) + " |")
+    if rep.guardrails:
+        out += ["", "## Guardrail triggers - stop and let the user check before continuing", ""]
+        out += [f"- `{g['rule']}` at `{g['location']}` - criterion: `{g['reference']}`" for g in rep.guardrails]
     out += ["", "## What it will be able to do", ""]
     inv = rep.inventory
     out.append(f"- Capabilities seen in code: {', '.join(inv['capabilities']) or 'none detected'}")
@@ -860,7 +1024,8 @@ def to_markdown(rep: Report) -> str:
         out += [f"### [{f.severity}] {f.title}{'  (blocking)' if f.blocking else ''}",
                 f"- Rule `{f.rule}` · {f.category} · `{loc}`",
                 f"- Evidence: `{f.evidence}`" if f.evidence else "",
-                f"- {f.observation}", f"- **Fix / decision:** {f.recommendation}", ""]
+                f"- {f.observation}", f"- **Fix / decision:** {f.recommendation}",
+                f"- Criterion: `{f.reference}` (guardrail: user confirms before continuing)" if f.guardrail else None, ""]
     return "\n".join(x for x in out if x is not None)
 
 
@@ -883,16 +1048,21 @@ def to_csv(rep: Report, team: str, repo_name: str) -> str:
     return buf.getvalue()
 
 
-def scan(target: str, mandate: str | None = None, keep: bool = False) -> Report:
+def scan(target: str, mandate: str | None = None, keep: bool = False, allow_hosts: list | None = None) -> Report:
     q = Path(tempfile.mkdtemp(prefix="saaf-customs-"))
     try:
         root, resolved, ref = fetch(target, q)
-        sc = Scanner(root, load_mandate(mandate) if mandate else None)
+        mand = load_mandate(mandate) if mandate else None
+        declared = allow_hosts is not None or (mand is not None and "allowed_hosts" in mand)
+        allowed = list(allow_hosts or []) + list((mand or {}).get("allowed_hosts") or [])
+        sc = Scanner(root, mand, allowed if declared else None)
         sc.run()
         sc.findings.sort(key=lambda f: (SEV_RANK[f.severity], not f.blocking, f.file, f.line))
         inv = {k: (sorted(v) if isinstance(v, set) else v) for k, v in sc.inventory.items()}
         rep = Report(target, resolved, ref, sc.files, sc.findings, inv)
         rep.verdict = verdict_for(sc.findings)
+        rep.guardrails = [{"rule": f.rule, "location": f"{f.file}:{f.line}" if f.line else f.file,
+                           "reference": f.reference} for f in sc.findings if f.guardrail]
         if keep and str(root).startswith(str(q)):
             rep.inventory["quarantine_path"] = str(root)  # only ever a temp copy, never the user's own directory
         return rep
@@ -908,6 +1078,9 @@ def main(argv=None):
     s.add_argument("target")
     s.add_argument("--out", help="directory for report.md / findings.json / findings.csv")
     s.add_argument("--mandate", help="SAAF agent.yaml of the agent that would consume this component")
+    s.add_argument("--allow-host", action="append", metavar="HOST",
+                   help="host the component is expected to contact (repeatable; subdomains included). "
+                        "Any other host in code or instruction files is reported as undeclared egress")
     s.add_argument("--team", default="SAAF Customs", help="team column for the SAAF findings CSV")
     s.add_argument("--repo-name", help="repo column for the CSV (defaults to the target's name)")
     s.add_argument("--keep", action="store_true", help="keep the quarantine copy for manual (LLM) review")
@@ -916,7 +1089,7 @@ def main(argv=None):
                    help="exit non-zero at this verdict (CI). default: block")
     a = ap.parse_args(argv)
     try:
-        rep = scan(a.target, a.mandate, a.keep)
+        rep = scan(a.target, a.mandate, a.keep, a.allow_host)
     except Exception as e:  # fetch errors etc.
         print(f"saaf-customs: cannot inspect {a.target}: {e}", file=sys.stderr)
         return 3

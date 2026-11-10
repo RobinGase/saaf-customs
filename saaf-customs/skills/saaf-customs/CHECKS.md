@@ -53,6 +53,24 @@ Use after the deterministic scan. Answer each item for the target; cite file:lin
 - **Auditee documents as data:** if the component feeds documents to a model, does it mark
   them as untrusted data, or can a crafted document instruct the agent?
 
+## G. Guardrail triggers (the user checks before the review continues)
+Each has a criterion reference: what triggers it, what the user is asked, and how to decide.
+New criteria start from [references/_TEMPLATE.md](references/_TEMPLATE.md).
+
+| Criterion | Rules | Reference |
+|---|---|---|
+| Hidden Unicode | `UNI-TAG-CHARS`, `UNI-BIDI`, `UNI-ZERO-WIDTH` | [hidden-unicode.md](references/hidden-unicode.md) |
+| Homoglyphs | `UNI-HOMOGLYPH`, `UNI-IDN-HOST` | [homoglyphs.md](references/homoglyphs.md) |
+| Encoded strings | `OBF-BASE64-TEXT`, `OBF-BASE64-BLOB`, `EXEC-DECODE-EVAL` | [encoded-strings.md](references/encoded-strings.md) |
+| Unexpected upstream network | `NET-UNDECLARED-EGRESS`, `NET-EGRESS-INVENTORY`, `NET-SUSPICIOUS-DOMAIN`, `EXFIL-KNOWN-SINK`, `MCP-REMOTE` | [unexpected-egress.md](references/unexpected-egress.md) |
+
+- Did the user answer every trigger, and is each answer recorded in the report?
+- Homoglyphs: any word written wholly in another script that reads as an ASCII name? The
+  scanner only catches mixed-script words.
+- Encoded strings: anything encoded another way (hex, base32, compressed, split across
+  concatenations)?
+- Egress: any host built at run time or read from config that the static list cannot show?
+
 ## Severity guide
 | Rating | Example |
 |---|---|
