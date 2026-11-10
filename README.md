@@ -19,7 +19,7 @@ is npm:some-mcp@1.2.0 safe to install?
 ```
 Scanner only (Python 3.9+, no dependencies):
 ```bash
-python3 -I skills/saaf-customs/scripts/customs.py scan <target> --out reports/x [--mandate agent.yaml]
+python3 -I skills/saaf-customs/scripts/customs.py scan <target> --out reports/x [--mandate agent.yaml] [--allow-host api.example.com]
 # <target>: ./path | https://github.com/o/r[/tree/ref/sub] | github:o/r@ref | npm:pkg@ver | pypi:pkg==ver
 # exit 0 ALLOW · 2 BLOCK (--fail-on review to also fail on REVIEW) · 3 fetch error
 ```
@@ -30,15 +30,20 @@ Writes `report.md`, `findings.json` and `findings.csv` (`title,repo,risk_rating,
 
 ## What it checks
 - **Prompt injection / tool poisoning:** override phrasing, "don't tell the user", fake `<IMPORTANT>`/`<system>` tags, hidden HTML comments, cross-tool shadowing
-- **Hidden Unicode:** tag-character smuggling (decoded in the report), bidi overrides, zero-width runs
+- **Hidden Unicode and homoglyphs:** tag-character smuggling (decoded in the report), bidi overrides, zero-width runs, look-alike letters mixed into ASCII words, punycode hosts
 - **Code that runs without asking:** npm install scripts, `setup.py` cmdclass, Claude Code hooks; shipped `settings.json` that widens permissions
 - **Exfiltration, credential theft, persistence:** env sent to the network, `~/.ssh`/`~/.aws`/keychain reads, webhook/tunnel sinks, writes to `~/.claude`/`CLAUDE.md`/shell rc
-- **Obfuscation:** `eval(atob(...))`, `exec(b64decode(...))`, marshal, char-code strings
+- **Obfuscation:** `eval(atob(...))`, `exec(b64decode(...))`, marshal, char-code strings, base64 strings that decode to readable text (preview in the report)
+- **Unexpected upstream network:** every host in code and instruction files, checked against `--allow-host` / the mandate's `allowed_hosts`
 - **MCP and supply chain:** `npx pkg@latest` rug pulls, remote/HTTP MCP, inline secrets, typosquats, unpinned deps, binaries, escaping symlinks, risky workflows
 - **SAAF mandate fit:** detected capabilities checked against the consuming agent's `agent.yaml` `forbidden_actions`
 
 Claude then reads every instruction file, hook, install script and MCP tool in full, and checks whether behaviour matches the description
 ([CHECKS.md](skills/saaf-customs/CHECKS.md)). It confirms or drops each scanner hit.
+
+**Guardrail triggers.** Hidden Unicode, homoglyphs, encoded strings and unexpected upstream network stop the review until
+the user has checked the evidence. Each has a high-level criterion reference in
+[skills/saaf-customs/references/](skills/saaf-customs/references/), written from a shared template.
 
 ## Safety model
 The target is never installed, built, imported or run. Clones disable git hooks, symlinks and submodules.
